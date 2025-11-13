@@ -1,123 +1,72 @@
+// The MIT License (MIT)
+//
+// # Copyright (c) 2016 xtaci
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package main
 
 import (
 	"crypto/sha1"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/big"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
 
-	"github.com/golang/snappy"
+	"github.com/fatih/color"
 	"github.com/urfave/cli"
-	kcp "github.com/xtaci/kcp-go"
+	kcp "github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/kcptun/std"
+	"github.com/xtaci/qpp"
 	"github.com/xtaci/smux"
+	"github.com/xtaci/tcpraw"
 )
 
-var (
-	// VERSION is injected by buildflags
-	VERSION = "SELFBUILD"
+const (
 	// SALT is use for pbkdf2 key expansion
 	SALT = "kcp-go"
+	// maximum supported smux version
+	maxSmuxVer = 2
 )
 
-type compStream struct {
-	conn net.Conn
-	w    *snappy.Writer
-	r    *snappy.Reader
-}
+const (
+	TGT_UNIX = iota
+	TGT_TCP
+)
 
-func (c *compStream) Read(p []byte) (n int, err error) {
-	return c.r.Read(p)
-}
-
-func (c *compStream) Write(p []byte) (n int, err error) {
-	n, err = c.w.Write(p)
-	err = c.w.Flush()
-	return n, err
-}
-
-func (c *compStream) Close() error {
-	return c.conn.Close()
-}
-
-func newCompStream(conn net.Conn) *compStream {
-	c := new(compStream)
-	c.conn = conn
-	c.w = snappy.NewBufferedWriter(conn)
-	c.r = snappy.NewReader(conn)
-	return c
-}
-
-// handle multiplex-ed connection
-func handleMux(conn io.ReadWriteCloser, config *Config) {
-	// stream multiplex
-	smuxConfig := smux.DefaultConfig()
-	smuxConfig.MaxReceiveBuffer = config.SockBuf
-	smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
-
-	mux, err := smux.Server(conn, smuxConfig)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	defer mux.Close()
-	for {
-		p1, err := mux.AcceptStream()
-		if err != nil {
-			log.Println(err)
-			return
-		}
-		p2, err := net.DialTimeout("tcp", config.Target, 5*time.Second)
-		if err != nil {
-			p1.Close()
-			log.Println(err)
-			continue
-		}
-		go handleClient(p1, p2)
-	}
-}
-
-func handleClient(p1, p2 io.ReadWriteCloser) {
-	log.Println("stream opened")
-	defer log.Println("stream closed")
-	defer p1.Close()
-	defer p2.Close()
-
-	// start tunnel
-	p1die := make(chan struct{})
-	go func() { io.Copy(p1, p2); close(p1die) }()
-
-	p2die := make(chan struct{})
-	go func() { io.Copy(p2, p1); close(p2die) }()
-
-	// wait for tunnel termination
-	select {
-	case <-p1die:
-	case <-p2die:
-	}
-}
-
-func checkError(err error) {
-	if err != nil {
-		log.Printf("%+v\n", err)
-		os.Exit(-1)
-	}
-}
+// VERSION is injected by buildflags
+var VERSION = "SELFBUILD"
 
 func main() {
-	rand.Seed(int64(time.Now().Nanosecond()))
 	if VERSION == "SELFBUILD" {
 		// add more log flags for debugging
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
+
 	myApp := cli.NewApp()
 	myApp.Name = "kcptun"
 	myApp.Usage = "server(with SMUX)"
@@ -126,12 +75,12 @@ func main() {
 		cli.StringFlag{
 			Name:  "listen,l",
 			Value: ":29900",
-			Usage: "kcp server listen address",
+			Usage: `kcp server listen address, eg: "IP:29900" for a single port, "IP:minport-maxport" for port range`,
 		},
 		cli.StringFlag{
 			Name:  "target, t",
 			Value: "127.0.0.1:12948",
-			Usage: "target server address",
+			Usage: "target server address, or path/to/unix_socket",
 		},
 		cli.StringFlag{
 			Name:   "key",
@@ -142,8 +91,18 @@ func main() {
 		cli.StringFlag{
 			Name:  "crypt",
 			Value: "aes",
-			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, none",
+			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null",
 		},
+		cli.BoolFlag{
+			Name:  "QPP",
+			Usage: "enable Quantum Permutation Pads(QPP)",
+		},
+		cli.IntFlag{
+			Name:  "QPPCount",
+			Value: 61,
+			Usage: "the prime number of pads to use for QPP: The more pads you use, the more secure the encryption. Each pad requires 256 bytes.",
+		},
+
 		cli.StringFlag{
 			Name:  "mode",
 			Value: "fast",
@@ -209,14 +168,34 @@ func main() {
 			Hidden: true,
 		},
 		cli.IntFlag{
-			Name:   "sockbuf",
-			Value:  4194304, // socket buffer size in bytes
-			Hidden: true,
+			Name:  "sockbuf",
+			Value: 4194304, // socket buffer size in bytes
+			Usage: "per-socket buffer in bytes",
 		},
 		cli.IntFlag{
-			Name:   "keepalive",
-			Value:  10, // nat keepalive interval in seconds
-			Hidden: true,
+			Name:  "smuxver",
+			Value: 1,
+			Usage: "specify smux version, available 1,2",
+		},
+		cli.IntFlag{
+			Name:  "smuxbuf",
+			Value: 4194304,
+			Usage: "the overall de-mux buffer in bytes",
+		},
+		cli.IntFlag{
+			Name:  "streambuf",
+			Value: 2097152,
+			Usage: "per stream receive buffer in bytes, smux v2+",
+		},
+		cli.IntFlag{
+			Name:  "keepalive",
+			Value: 10, // nat keepalive interval in seconds
+			Usage: "seconds between heartbeats",
+		},
+		cli.IntFlag{
+			Name:  "closewait",
+			Value: 30,
+			Usage: "the seconds to wait before tearing down a connection",
 		},
 		cli.StringFlag{
 			Name:  "snmplog",
@@ -236,6 +215,14 @@ func main() {
 			Name:  "log",
 			Value: "",
 			Usage: "specify a log file to output, default goes to stderr",
+		},
+		cli.BoolFlag{
+			Name:  "quiet",
+			Usage: "to suppress the 'stream open/close' messages",
+		},
+		cli.BoolFlag{
+			Name:  "tcp",
+			Usage: "to emulate a TCP connection(linux)",
 		},
 		cli.StringFlag{
 			Name:  "c",
@@ -263,11 +250,19 @@ func main() {
 		config.Resend = c.Int("resend")
 		config.NoCongestion = c.Int("nc")
 		config.SockBuf = c.Int("sockbuf")
+		config.SmuxBuf = c.Int("smuxbuf")
+		config.StreamBuf = c.Int("streambuf")
+		config.SmuxVer = c.Int("smuxver")
 		config.KeepAlive = c.Int("keepalive")
 		config.Log = c.String("log")
 		config.SnmpLog = c.String("snmplog")
 		config.SnmpPeriod = c.Int("snmpperiod")
 		config.Pprof = c.Bool("pprof")
+		config.Quiet = c.Bool("quiet")
+		config.TCP = c.Bool("tcp")
+		config.QPP = c.Bool("QPP")
+		config.QPPCount = c.Int("QPPCount")
+		config.CloseWait = c.Int("closewait")
 
 		if c.String("c") != "" {
 			//Now only support json config file
@@ -295,9 +290,56 @@ func main() {
 		}
 
 		log.Println("version:", VERSION)
+		log.Println("smux version:", config.SmuxVer)
+		log.Println("listening on:", config.Listen)
+		log.Println("target:", config.Target)
+		log.Println("encryption:", config.Crypt)
+		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
+		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
+		log.Println("compression:", !config.NoComp)
+		log.Println("mtu:", config.MTU)
+		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
+		log.Println("acknodelay:", config.AckNodelay)
+		log.Println("dscp:", config.DSCP)
+		log.Println("sockbuf:", config.SockBuf)
+		log.Println("smuxbuf:", config.SmuxBuf)
+		log.Println("streambuf:", config.StreamBuf)
+		log.Println("keepalive:", config.KeepAlive)
+		log.Println("snmplog:", config.SnmpLog)
+		log.Println("snmpperiod:", config.SnmpPeriod)
+		log.Println("pprof:", config.Pprof)
+		log.Println("quiet:", config.Quiet)
+		log.Println("tcp:", config.TCP)
+
+		if config.QPP {
+			minSeedLength := qpp.QPPMinimumSeedLength(8)
+			if len(config.Key) < minSeedLength {
+				color.Red("QPP Warning: 'key' has size of %d bytes, required %d bytes at least", len(config.Key), minSeedLength)
+			}
+
+			minPads := qpp.QPPMinimumPads(8)
+			if config.QPPCount < minPads {
+				color.Red("QPP Warning: QPPCount %d, required %d at least", config.QPPCount, minPads)
+			}
+
+			if new(big.Int).GCD(nil, nil, big.NewInt(int64(config.QPPCount)), big.NewInt(8)).Int64() != 1 {
+				color.Red("QPP Warning: QPPCount %d, choose a prime number for security", config.QPPCount)
+			}
+		}
+		// parameters check
+		if config.SmuxVer > maxSmuxVer {
+			log.Fatal("unsupported smux version:", config.SmuxVer)
+		}
+
+		log.Println("initiating key derivation")
 		pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
+		log.Println("key derivation done")
 		var block kcp.BlockCrypt
 		switch config.Crypt {
+		case "null":
+			block = nil
+		case "sm4":
+			block, _ = kcp.NewSM4BlockCrypt(pass[:16])
 		case "tea":
 			block, _ = kcp.NewTEABlockCrypt(pass[:16])
 		case "xor":
@@ -325,89 +367,180 @@ func main() {
 			block, _ = kcp.NewAESBlockCrypt(pass)
 		}
 
-		lis, err := kcp.ListenWithOptions(config.Listen, block, config.DataShard, config.ParityShard)
-		checkError(err)
-		log.Println("listening on:", lis.Addr())
-		log.Println("target:", config.Target)
-		log.Println("encryption:", config.Crypt)
-		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
-		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
-		log.Println("compression:", !config.NoComp)
-		log.Println("mtu:", config.MTU)
-		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
-		log.Println("acknodelay:", config.AckNodelay)
-		log.Println("dscp:", config.DSCP)
-		log.Println("sockbuf:", config.SockBuf)
-		log.Println("keepalive:", config.KeepAlive)
-		log.Println("snmplog:", config.SnmpLog)
-		log.Println("snmpperiod:", config.SnmpPeriod)
-		log.Println("pprof:", config.Pprof)
-
-		if err := lis.SetDSCP(config.DSCP); err != nil {
-			log.Println("SetDSCP:", err)
-		}
-		if err := lis.SetReadBuffer(config.SockBuf); err != nil {
-			log.Println("SetReadBuffer:", err)
-		}
-		if err := lis.SetWriteBuffer(config.SockBuf); err != nil {
-			log.Println("SetWriteBuffer:", err)
-		}
-
-		go snmpLogger(config.SnmpLog, config.SnmpPeriod)
+		go std.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
 		if config.Pprof {
 			go http.ListenAndServe(":6060", nil)
 		}
 
-		for {
-			if conn, err := lis.AcceptKCP(); err == nil {
-				log.Println("remote address:", conn.RemoteAddr())
-				conn.SetStreamMode(true)
-				conn.SetWriteDelay(true)
-				conn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
-				conn.SetMtu(config.MTU)
-				conn.SetWindowSize(config.SndWnd, config.RcvWnd)
-				conn.SetACKNoDelay(config.AckNodelay)
+		// create shared QPP
+		var _Q_ *qpp.QuantumPermutationPad
+		if config.QPP {
+			_Q_ = qpp.NewQPP([]byte(config.Key), uint16(config.QPPCount))
+		}
 
-				if config.NoComp {
-					go handleMux(conn, &config)
+		// main loop
+		var wg sync.WaitGroup
+		loop := func(lis *kcp.Listener) {
+			defer wg.Done()
+			if err := lis.SetDSCP(config.DSCP); err != nil {
+				log.Println("SetDSCP:", err)
+			}
+			if err := lis.SetReadBuffer(config.SockBuf); err != nil {
+				log.Println("SetReadBuffer:", err)
+			}
+			if err := lis.SetWriteBuffer(config.SockBuf); err != nil {
+				log.Println("SetWriteBuffer:", err)
+			}
+
+			for {
+				if conn, err := lis.AcceptKCP(); err == nil {
+					log.Println("remote address:", conn.RemoteAddr())
+					conn.SetStreamMode(true)
+					conn.SetWriteDelay(false)
+					conn.SetNoDelay(config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
+					conn.SetMtu(config.MTU)
+					conn.SetWindowSize(config.SndWnd, config.RcvWnd)
+					conn.SetACKNoDelay(config.AckNodelay)
+
+					if config.NoComp {
+						go handleMux(_Q_, conn, &config)
+					} else {
+						go handleMux(_Q_, std.NewCompStream(conn), &config)
+					}
 				} else {
-					go handleMux(newCompStream(conn), &config)
+					log.Printf("%+v", err)
 				}
-			} else {
-				log.Printf("%+v", err)
 			}
 		}
+
+		mp, err := std.ParseMultiPort(config.Listen)
+		if err != nil {
+			log.Println(err)
+			return err
+		}
+
+		// create multiple listener
+		for port := mp.MinPort; port <= mp.MaxPort; port++ {
+			listenAddr := fmt.Sprintf("%v:%v", mp.Host, port)
+			if config.TCP { // tcp dual stack
+				if conn, err := tcpraw.Listen("tcp", listenAddr); err == nil {
+					log.Printf("Listening on: %v/tcp", listenAddr)
+					lis, err := kcp.ServeConn(block, config.DataShard, config.ParityShard, conn)
+					checkError(err)
+					wg.Add(1)
+					go loop(lis)
+				} else {
+					log.Println(err)
+				}
+			}
+
+			// udp stack
+			log.Printf("Listening on: %v/udp", listenAddr)
+			lis, err := kcp.ListenWithOptions(listenAddr, block, config.DataShard, config.ParityShard)
+			checkError(err)
+			wg.Add(1)
+			go loop(lis)
+		}
+
+		wg.Wait()
+		return nil
 	}
 	myApp.Run(os.Args)
 }
 
-func snmpLogger(path string, interval int) {
-	if path == "" || interval == 0 {
+// handle multiplex-ed connection
+func handleMux(_Q_ *qpp.QuantumPermutationPad, conn net.Conn, config *Config) {
+	// check target type
+	targetType := TGT_TCP
+	if _, _, err := net.SplitHostPort(config.Target); err != nil {
+		targetType = TGT_UNIX
+	}
+	log.Println("smux version:", config.SmuxVer, "on connection:", conn.LocalAddr(), "->", conn.RemoteAddr())
+
+	// stream multiplex
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.Version = config.SmuxVer
+	smuxConfig.MaxReceiveBuffer = config.SmuxBuf
+	smuxConfig.MaxStreamBuffer = config.StreamBuf
+	smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
+
+	mux, err := smux.Server(conn, smuxConfig)
+	if err != nil {
+		log.Println(err)
 		return
 	}
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
-	defer ticker.Stop()
+	defer mux.Close()
+
 	for {
-		select {
-		case <-ticker.C:
-			f, err := os.OpenFile(time.Now().Format(path), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			w := csv.NewWriter(f)
-			// write header in empty file
-			if stat, err := f.Stat(); err == nil && stat.Size() == 0 {
-				if err := w.Write(append([]string{"Unix"}, kcp.DefaultSnmp.Header()...)); err != nil {
-					log.Println(err)
-				}
-			}
-			if err := w.Write(append([]string{fmt.Sprint(time.Now().Unix())}, kcp.DefaultSnmp.ToSlice()...)); err != nil {
-				log.Println(err)
-			}
-			kcp.DefaultSnmp.Reset()
-			w.Flush()
-			f.Close()
+		stream, err := mux.AcceptStream()
+		if err != nil {
+			log.Println(err)
+			return
 		}
+
+		go func(p1 *smux.Stream) {
+			var p2 net.Conn
+			var err error
+
+			switch targetType {
+			case TGT_TCP:
+				p2, err = net.Dial("tcp", config.Target)
+				if err != nil {
+					log.Println(err)
+					p1.Close()
+					return
+				}
+				handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet, config.CloseWait)
+			case TGT_UNIX:
+				p2, err = net.Dial("unix", config.Target)
+				if err != nil {
+					log.Println(err)
+					p1.Close()
+					return
+				}
+				handleClient(_Q_, []byte(config.Key), p1, p2, config.Quiet, config.CloseWait)
+			}
+
+		}(stream)
+	}
+}
+
+// handleClient pipes two streams
+func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, p1 *smux.Stream, p2 net.Conn, quiet bool, closeWait int) {
+	logln := func(v ...interface{}) {
+		if !quiet {
+			log.Println(v...)
+		}
+	}
+
+	defer p1.Close()
+	defer p2.Close()
+
+	logln("stream opened", "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
+	defer logln("stream closed", "in:", fmt.Sprint(p1.RemoteAddr(), "(", p1.ID(), ")"), "out:", p2.RemoteAddr())
+
+	var s1, s2 io.ReadWriteCloser = p1, p2
+	// if QPP is enabled, create QPP read write closer
+	if _Q_ != nil {
+		// replace s1 with QPP port
+		s1 = std.NewQPPPort(p1, _Q_, seed)
+	}
+
+	// stream layer
+	err1, err2 := std.Pipe(s1, s2, closeWait)
+
+	// handles transport layer errors
+	if err1 != nil && err1 != io.EOF {
+		logln("pipe:", err1, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.RemoteAddr(), ")"))
+	}
+	if err2 != nil && err2 != io.EOF {
+		logln("pipe:", err2, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.RemoteAddr(), ")"))
+	}
+}
+
+func checkError(err error) {
+	if err != nil {
+		log.Printf("%+v\n", err)
+		os.Exit(-1)
 	}
 }
